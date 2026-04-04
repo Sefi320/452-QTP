@@ -45,6 +45,7 @@ library(pracma)
 library(doParallel)
 library(foreach)
 library(parallel)
+library(gt)
 ```
 
 
@@ -57,7 +58,7 @@ train_start  <- as.Date("2000-06-01")
 train_end    <- as.Date("2024-12-31")
 test_start   <- as.Date("2025-01-01")
 test_end    <- as.Date("2026-03-31")
-window_roll  <- 252L
+window_roll_roll  <- 252L
 entry_zscore <- 1.5
 max_innov_days <- 5L
 innov_mult   <- 3.0
@@ -141,7 +142,7 @@ pair_grid <- tidyr::expand_grid(
 
 ### 3.1 Spread Feature Computation
 
-+ For each of the 66 pairs, we compute three rolling features that characterize mean-reversion behavior. The spread is defined as `S_t = p1_t - beta_hat * p2_t` where `beta_hat` comes from an OLS regression over the rolling window. Half-life measures speed of reversion, Hurst exponent measures persistence structure (H < 0.5 is mean-reverting), and spread volatility captures the magnitude of movements.
++ For each of the 66 pairs, we compute three rolling features that characterize mean-reversion behavior. The spread is defined as `S_t = p1_t - beta_hat * p2_t` where `beta_hat` comes from an OLS regression over the rolling window_roll. Half-life measures speed of reversion, Hurst exponent measures persistence structure (H < 0.5 is mean-reverting), and spread volatility captures the magnitude of movements.
 
 ```{r}
 #| label: Features-funcs
@@ -194,16 +195,16 @@ compute_pair_feats_monthEnd <- function(pairs, month_end, wide_prices){
   leg2 <- pairs$leg2
   valid_from <- pairs$valid_from
   
-  window_data <- wide_prices %>%
+  window_roll_data <- wide_prices %>%
     dplyr::filter(date <= month_end & date >= valid_from) %>%
     dplyr::select(date, p1 = dplyr::all_of(leg1), p2 = dplyr::all_of(leg2)) %>%
     tidyr::drop_na() %>%
-    dplyr::slice_tail(n = window) # this pulls the last n days of data from month end depending on the window used
+    dplyr::slice_tail(n = window_roll) # this pulls the last n days of data from month end depending on the window_roll used
   
   
-  beta_ols <- coef(lm(p1 ~ p2, data = window_data))[2]
+  beta_ols <- coef(lm(p1 ~ p2, data = window_roll_data))[2]
 
-   spread <- window_data$p1 - beta_ols * window_data$p2 # this is the scaled spread that determines trade size
+   spread <- window_roll_data$p1 - beta_ols * window_roll_data$p2 # this is the scaled spread that determines trade size
 
   tibble::tibble(
     pair_id    = pairs$pair_id,
@@ -229,7 +230,7 @@ features_list <- foreach::foreach(
   i = seq_len(nrow(task_grid)),
   .combine = dplyr::bind_rows,
   .packages = c("tidyverse", "slider","pracma"),
-  .export = c("pair_grid", "month_ends", "dat_wide", "window",
+  .export = c("pair_grid", "month_ends", "dat_wide", "window_roll",
               "half_life", "hurst_exp", "spread_vol",
               "compute_pair_feats_monthEnd")
 ) %dopar% {
