@@ -58,7 +58,7 @@ train_start  <- as.Date("2000-06-01")
 train_end    <- as.Date("2024-12-31")
 test_start   <- as.Date("2025-01-01")
 test_end    <- as.Date("2026-03-31")
-window_roll_roll  <- 252L
+window_roll  <- 252L
 entry_zscore <- 1.5
 max_innov_days <- 5L
 innov_mult   <- 3.0
@@ -191,29 +191,35 @@ month_ends <- dat_wide %>%
   dplyr::pull(date)
   
 compute_pair_feats_monthEnd <- function(pairs, month_end, wide_prices){
-  leg1 <- pairs$leg1
-  leg2 <- pairs$leg2
-  valid_from <- pairs$valid_from
-  
-  window_roll_data <- wide_prices %>%
-    dplyr::filter(date <= month_end & date >= valid_from) %>%
-    dplyr::select(date, p1 = dplyr::all_of(leg1), p2 = dplyr::all_of(leg2)) %>%
-    tidyr::drop_na() %>%
-    dplyr::slice_tail(n = window_roll) # this pulls the last n days of data from month end depending on the window_roll used
-  
-  
-  beta_ols <- coef(lm(p1 ~ p2, data = window_roll_data))[2]
+    leg1 <- pairs$leg1
+    leg2 <- pairs$leg2
+    valid_from <- pairs$valid_from
 
-   spread <- window_roll_data$p1 - beta_ols * window_roll_data$p2 # this is the scaled spread that determines trade size
+    window_roll_data <- wide_prices %>%
+      dplyr::filter(date <= month_end & date >= valid_from) %>%
+      dplyr::select(date, p1 = dplyr::all_of(leg1), p2 = dplyr::all_of(leg2)) %>%
+      tidyr::drop_na() %>%
+      dplyr::slice_tail(n = window_roll)
 
-  tibble::tibble(
-    pair_id    = pairs$pair_id,
-    date       = month_end,
-    half_life  = half_life(spread),
-    hurst      = hurst_exp(spread),
-    spread_vol = spread_vol(spread)
-  )
-}
+    if (nrow(window_roll_data) < 20) {
+      return(tibble::tibble(
+        pair_id = pairs$pair_id, date = month_end,
+        half_life = NA_real_, hurst = NA_real_, spread_vol = NA_real_
+      ))
+    }
+
+    beta_ols <- coef(lm(p1 ~ p2, data = window_roll_data))[2]
+
+    spread <- window_roll_data$p1 - beta_ols * window_roll_data$p2
+
+    tibble::tibble(
+      pair_id    = pairs$pair_id,
+      date       = month_end,
+      half_life  = half_life(spread),
+      hurst      = hurst_exp(spread),
+      spread_vol = spread_vol(spread)
+    )
+  }
 
 ```
 
