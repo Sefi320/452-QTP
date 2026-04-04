@@ -1,0 +1,38 @@
+flowchart TD
+      A[Daily Price Data via API\nSPY + 11 Sector ETFs] --> B[Compute Spread\nfor all 66 Pairs]
+
+      subgraph MONTHLY["Monthly — Pair Selection"]
+          B --> C[Compute Spread Features\nhalf-life · Hurst exponent · spread vol]
+          C --> D[Cluster Pairs\nk-means + Hierarchical Ward\nElbow method + Silhouette validation]
+          D --> E[Select Top 10 Tradeable Pairs\nshort half-life · H < 0.5 · adequate vol]
+          E --> F[Size Positions\nInverse Vol Parity Weighting]
+      end
+
+      subgraph DAILY["Daily — Signal Generation"]
+          F --> G[Kalman Filter per Pair\nEstimate β_t · spread · innovation]
+          G --> H{Pair in\nTradeable Cluster?}
+          H -->|NO| I[No Trade]
+          H -->|YES| J{KF Spread\nDeviated from Mean?}
+          J -->|NO| K[No Action]
+          J -->|YES| L[ENTER TRADE\nLong undervalued leg\nShort overvalued leg\nHedge ratio = β_t]
+      end
+
+      subgraph EXIT["Exit Rules"]
+          L --> M{Spread returned\nto KF mean?}
+          M -->|YES| N[EXIT — Take Profit]
+          M -->|NO| O{Days in trade\n> 2× half-life?}
+          O -->|YES| P[EXIT — Time Stop]
+          O -->|NO| Q[Hold Position]
+          Q --> G
+      end
+
+      subgraph OVERRIDE["Override"]
+          G --> R{KF Innovation\nSpike?}
+          R -->|YES| S[FORCE EXIT]
+      end
+
+      subgraph REBALANCE["Month-End Rebalancing"]
+          T[Re-run Clustering] --> U{Pair still in\nTradeable Cluster?}
+          U -->|YES| V[Resize to New\nVol Parity Weight]
+          U -->|NO| W[Force Close Position]
+      end

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PATH=\"$PATH:/c/Users/soume/AppData/Local/Microsoft/WinGet/Packages/oschwartz10612.Poppler_Microsoft.Winget.Source_8wekyb3d8bbwe/poppler-25.07.0/Library/bin\")",
+      "Bash(pdftoppm -v)",
+      "Bash(pdftotext \"C:/Users/soume/OneDrive/Documents/UNIVERSITY/UofA/25-26/Winter 2026/FIN 452/Papers and Notes/Quantitative Trading.pdf\" \"C:/Users/soume/OneDrive/Documents/UNIVERSITY/UofA/25-26/Winter 2026/FIN 452/Papers and Notes/QT_text.txt\")",
+      "Bash(pdftotext \"C:/Users/soume/OneDrive/Documents/UNIVERSITY/UofA/25-26/Fall 2025/FIN 450/Papers and Notes/Tidy ML Workflow.pdf\" \"C:/Users/soume/OneDrive/Documents/UNIVERSITY/UofA/25-26/Fall 2025/FIN 450/Papers and Notes/TidyML_text.txt\")"
+    ]
+  }
+}
