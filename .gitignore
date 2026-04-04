@@ -47,3 +47,9 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+ # R Project
+  *.Rproj
+
+  # Quarto cache (already covered by *_cache/ but explicit)
+  *_cache/
