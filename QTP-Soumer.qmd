@@ -637,6 +637,51 @@ apply_exit_rules <- function(signal_df, half_life_days) {
 
 ### 6.1 Backtesting
 
++ The backtest iterates month by month. At each month-end: Layer 1 re-clusters all 66 pairs and selects the tradeable set with inverse volatility parity weights. During the month, Layer 2 runs the Kalman Filter daily on each active pair. Pairs leaving the tradeable cluster are force-closed; pairs remaining are resized to new weights.
+
+
+```{r}
+
+backtest <- function(){
+  
+  # pull end of month dates for clustering rebalance
+  
+  # for first month of trading, pull last month's end date to have an initial cluster to    trade on
+  
+  # perform clustering at each month end - use function from earlier to choose tradeable    pairs
+  
+  # fit KF on tradeable pairs for each month and generate trade signals
+    # KF has a warmup period so that we ensure it's initialization for the first month
+      # is stable 
+    # this must be done recursively, (for loop) because each day's trade decision depends       on last day's signal and trade
+  
+  # After signals are generated, add the safeguards:
+    # z-score - if z score crosses 0 then exit because the spread mean-reverted
+    # days_in_trade - if we hold a trade for more than 2*half_life that means it should've       # mean reverted by now so we exit regardless of price
+  
+    # Innovations - if innovations(errors) from KF fit are unusually large, that means          # that the relationship broke and a structural chg happened. So we exit to cut            # losses - could also mean we cut gains
+  
+  # To compute returns from trades, we assume that p1 is always long and p2 is always         short
+    # The relationship is derived from the beta from the dynamic model fit from before
+    # We weight each position by its inverse volatility (this ensures no single pair is
+      # overweighted and that we dont cluster our risk)
+    # if position yesterday was 1 (long) that means we are long p1 and short p2
+    # if positions yesterday was -1 (short) that mean we short p1 and long p2
+      # the return formula stays the same, the position sign filps it from long to short
+  
+  # Returns are calculated using yesterday's position * today's Cl-Cl return
+  
+  # All Trades/entry/exit are decided at close of each day, and executed at next open
+  
+  # get cum returns 
+  
+  
+}
+
+
+```
+
+
 ## 7. Parameter Optimization
 
 ### 7.1 Grid Search
