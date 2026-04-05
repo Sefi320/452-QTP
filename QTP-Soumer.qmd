@@ -34,7 +34,7 @@ execute:
 ## 2. Universe & Data
 
 ```{r}
-#| label: "Libraries"
+#| label: Libraries
 
 library(tidyverse)
 library(RTL)
@@ -47,13 +47,14 @@ library(foreach)
 library(parallel)
 library(gt)
 library(patchwork)
+library(dlm)
 ```
 
 
 
 
 ```{r}
-#| label: "Parameters"
+#| label: Parameters
 
 train_start  <- as.Date("2000-06-01")
 train_end    <- as.Date("2024-12-31")
@@ -96,7 +97,7 @@ ticker_info %>% gt::gt() %>%
 
 
 ```{r}
-#| label: "Data Download"
+#| label: Data Download
 
 dat_raw <- tidyquant::tq_get(tickers,
                              get = "stock.prices",
@@ -123,7 +124,7 @@ spy_prices <- dat_raw %>%
 + We enumerate all 66 unique pairs from the 12 assets. Each pair has a validity start date determined by the later inception date of its two legs.
 
 ```{r}
-#| label: "Pair Construction"
+#| label: Pair Construction
 
 pair_grid <- tidyr::expand_grid(
   leg1 = tickers,
@@ -233,8 +234,8 @@ cl <- parallel::makeCluster(parallel::detectCores() - 1)
 doParallel::registerDoParallel(cl)
 
 task_grid <- tidyr::expand_grid(
-  pair_idx = seq_len(nrow(pair_grid)),
-  month_idx = seq_along(month_ends)
+  pair_pos = seq_len(nrow(pair_grid)),
+  month_pos = seq_along(month_ends)
 )
 
 features_list <- foreach::foreach(
@@ -245,8 +246,8 @@ features_list <- foreach::foreach(
               "half_life", "hurst_exp", "spread_vol",
               "compute_pair_feats_monthEnd")
 ) %dopar% {
-  pr <- pair_grid[task_grid$pair_idx[i], ]
-  md <- month_ends[task_grid$month_idx[i]]
+  pr <- pair_grid[task_grid$pair_pos[i], ]
+  md <- month_ends[task_grid$month_pos[i]]
   compute_pair_feats_monthEnd(pr, md, dat_wide)
 }
 
@@ -359,6 +360,199 @@ p_elbow / p_sil
 ```{r}
 #| label: Cluster-selection
 
+# cluster all etfs by half-life, hurst, and spread vol. using k=6
+# trade within clusters that have lowest half-life and hurst (mean reverts quickly)
+
+select_tradeable_pairs <- function(feat_df, k, top_n = top_pairs) {
+  # feat_df must have columns: pair_id, half_life, hurst, spread_vol (raw)
+  # plus normalized versions for clustering
+
+  feat_mat <- feat_df %>%
+    dplyr::select(half_life_norm, hurst_norm, spread_vol_norm) %>%
+    as.matrix() 
+
+  # K-means clustering
+
+  km <- kmeans(feat_mat, centers = k, nstart = 25, iter.max = 100)
+  feat_df$cluster <- km$cluster
+
+  # Rank clusters by centroid
+  centroids <- feat_df %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::summarise(
+      mean_hl    = mean(half_life, na.rm = TRUE),
+      mean_hurst = mean(hurst, na.rm = TRUE),
+      mean_vol   = mean(spread_vol, na.rm = TRUE),
+      n_pairs    = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      rank_hl    = rank(mean_hl), # simple but soo cool!
+      rank_hurst = rank(mean_hurst),
+      combined_rank = rank_hl + rank_hurst
+    )
+
+  best_cluster <- centroids %>%
+    dplyr::slice_min(combined_rank, n = 1, with_ties = FALSE) %>%
+    dplyr::pull(cluster)
+
+  # Pairs in tradeable cluster
+  tradeable <- feat_df %>%
+    dplyr::filter(cluster == best_cluster) %>%
+    dplyr::arrange(spread_vol) %>%
+    dplyr::slice_head(n = min(top_n, nrow(.))) # if less than 10, we wont be under-invested
+
+  # Inverse volatility parity weights - i will use this in trading to keep risk from being concentrated in one pair
+  tradeable <- tradeable %>%
+    dplyr::mutate(
+      inv_vol = 1 / spread_vol,
+      weight  = inv_vol / sum(inv_vol)
+    )
+
+  list(
+    tradeable = tradeable,
+    centroids = centroids,
+    best_cluster = best_cluster,
+    all_pairs = feat_df
+  )
+}
+
+
+```
+
+
+
+### 3.5 Cluster Visualization
+
+
+```{r}
+#| label: cluster-viz
+
+# Visualize clusters for the last training month
+snap_raw <- features_train %>%
+  dplyr::filter(date == last_train_month)
+
+snap_norm <- train_baked %>%
+  dplyr::filter(date == last_train_month)
+
+snap_combined <- snap_raw %>%
+  dplyr::inner_join(
+    snap_norm %>%
+      dplyr::rename(half_life_norm = half_life, hurst_norm = hurst,
+                     spread_vol_norm = spread_vol),
+    by = c("pair_id", "date")
+  )
+
+cluster_result <- select_tradeable_pairs(snap_combined, optimal_k)
+
+ 
+viz_df <- cluster_result$all_pairs %>%
+    dplyr::mutate(
+      is_tradeable = cluster == cluster_result$best_cluster,
+      cluster_label = factor(cluster)
+    )
+
+  p_hl_hurst <- ggplot(viz_df, aes(x = half_life, y = hurst,
+                                     color = cluster_label, shape = is_tradeable)) +
+    geom_point(size = 3, alpha = 0.7) +
+    labs(title = "Clusters: Half-Life vs Hurst", x = "Half-Life (days)",
+         y = "Hurst Exponent", color = "Cluster", shape = "Tradeable") +
+    theme_minimal()
+
+  p_hl_vol <- ggplot(viz_df, aes(x = half_life, y = spread_vol,
+                                   color = cluster_label, shape = is_tradeable)) +
+    geom_point(size = 3, alpha = 0.7) +
+    labs(title = "Clusters: Half-Life vs Spread Vol", x = "Half-Life (days)",
+         y = "Spread Volatility", color = "Cluster", shape = "Tradeable") +
+    theme_minimal()
+
+  p_hl_hurst / p_hl_vol
+
+```
+
+
+```{r}
+#| label: cluster-selection-table
+
+cluster_result$centroids %>%
+  dplyr::mutate(selected = ifelse(cluster == cluster_result$best_cluster,
+                                  "*** Tradeable ***", "")) %>%
+  gt::gt() %>%
+  gt::fmt_number(columns = c(mean_hl, mean_hurst, mean_vol,
+                                rank_hl, rank_hurst, combined_rank), decimals = 2) %>%
+  gt::tab_header(title = "Cluster Centroids (Last Training Month)")
+
+```
+
+
+## 4. Layer 2: Signal Generation (Kalman Filter)
+
+### 4.1 Kalman Filter Setup
+
++ For each active pair, we fit a Kalman Filter that tracks how the relationship between the two assets evolves over time. Instead of assuming a fixed hedge ratio like OLS does, the KF lets the ratio drift day by day. The filter also estimates a dynamic intercept to account for persistent price level differences. Each day it outputs an updated hedge ratio, a spread estimate, and a prediction error (innovation) that tells us how surprised the model was by today's prices.
+
+
+```{r}
+#| label: Kalman-filtering
+
+# Build dlm model for a pair
+build_dlm <- function(par, X) { 
+  
+# initalize the model for filtering. this allows dynamic regression (i.e incorporating new data as it comes in to the 
+# new lm fit)
+# this model only takes the independent variable, then we feed it the dependent later on
+  
+  dlm::dlmModReg(
+    X  = matrix(X, ncol = 1),
+    dV = exp(par[1]),
+    dW = exp(par[2:3])
+  )
+}
+
+# Fit Kalman Filter for a single pair over a price vector
+
+fit_kalman_pair <- function(y, X, train_end_pos = NULL) {
+  # y = price of leg1, X = price of leg2
+  n <- length(y)
+  if (is.null(train_end_pos)) train_end_pos <- n
+
+  y_train <- y[1:train_end_pos]
+  X_train <- X[1:train_end_pos]
+
+  init_parm <- c(log(var(y_train, na.rm = TRUE)), log(0.01), log(0.01)) 
+  # giving it starting values to find dv and dW (basically works the same way as solver - using MLE)
+
+  fit <- tryCatch(
+    dlm::dlmMLE(
+      y     = y_train,
+      parm  = init_parm,
+      build = function(par) build_dlm(par, X_train),
+      control = list(maxit = 500) # limit so it doesnt run forever if it cant converge
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(NULL)
+
+  mod  <- build_dlm(fit$par, X) # using optimal paramters found above
+  filt <- dlm::dlmFilter(y, mod) # this runs on all data - including testing, but using params from training
+
+  beta_t  <- as.numeric(filt$m[-1, 1])
+  alpha_t <- as.numeric(filt$m[-1, 2])
+  spread  <- y - beta_t * X - alpha_t # this is the dynamic spread built from the output of filtering
+
+  # Innovations (one-step prediction errors)
+  y_pred <- as.numeric(filt$f)
+  innov  <- y - y_pred # difference between actual and expected
+
+  tibble::tibble(
+    pos     = seq_len(n),
+    beta_t  = beta_t,
+    alpha_t = alpha_t,
+    spread  = spread,
+    innov   = innov
+  )
+}
 
 
 ```
@@ -366,18 +560,78 @@ p_elbow / p_sil
 
 
 
-
-### 3.5 Cluster Visualization
-
-## 4. Layer 2: Signal Generation (Kalman Filter)
-
-### 4.1 Kalman Filter Setup
-
 ### 4.2 Signal Generation
+
+Trade signals fire when two conditions are met simultaneously: (1) the pair is in the current month's tradeable cluster, and (2) the Kalman Filter spread deviates beyond `entry_zscore` standard deviations of its rolling history. Long the pair when the spread is negative (leg1 undervalued relative to leg2), short when spread is positive.
+
+
+```{r}
+#| label: signal-generation
+
+generate_signals <- function(kf_result, entry_thresh = entry_zscore,
+                             roll_sd_window = 60L) {
+  # kf_result is a tibble with columns: idx, beta_t, alpha_t, spread, innov
+
+  kf_result %>%
+    dplyr::mutate(
+      spread_roll_mean = slider::slide_dbl(
+        spread, mean, .before = roll_sd_window - 1, .complete = TRUE
+      ),
+      spread_roll_sd = slider::slide_dbl(
+        spread, sd, .before = roll_sd_window - 1, .complete = TRUE
+      ),
+      z_score = (spread - spread_roll_mean) / spread_roll_sd,
+      # Innovation spike detection
+      innov_roll_mean = slider::slide_dbl(
+        abs(innov), mean, .before = roll_sd_window - 1, .complete = TRUE
+      ),
+      innov_roll_sd = slider::slide_dbl(
+        abs(innov), sd, .before = roll_sd_window - 1, .complete = TRUE
+      ),
+      innov_spike = abs(innov) > (innov_roll_mean + INNOV_MULT * innov_roll_sd)
+    )
+}
+
+
+```
+
+
 
 ## 5. Exit Rules & Override
 
 ### 5.1 Exit Logic
+
++ Three exit conditions govern position closure. Take-profit triggers when the spread returns to the Kalman Filter mean estimate (z-score crosses zero). The time stop exits after `2 * half_life` days regardless of P&L, preventing capital from being trapped in broken pairs. The innovation override force-exits when the KF prediction errors spike for `max_innov_days` consecutive days, signaling a structural break in the pair relationship.
+
+
+```{r}
+#| label: exit-rules
+
+apply_exit_rules <- function(signal_df, half_life_days) {
+  # signal_df has z_score, innov_spike, and trade signals
+  # Returns a tibble with final position accounting for exits
+
+  time_stop_days <- max(round(2 * half_life_days), 5) # gives at least a trading week for each trade in case very short half-life
+
+  signal_df %>%
+    dplyr::mutate(
+      # Raw signal from z-score
+      raw_signal = dplyr::case_when(
+        is.na(z_score) ~ 0L,
+        z_score < -entry_thresh ~ 1L,    # spread negative > long pair
+        z_score > entry_thresh  ~ -1L,   # spread positive > short pair
+        TRUE ~ 0L
+      ),
+      innov_consec = slider::slide_dbl(
+        as.numeric(innov_spike),
+        sum, .before = N_INNOV_DAYS - 1, .complete = TRUE
+      ),
+      innov_override = dplyr::coalesce(innov_consec >= max_innov_days, FALSE)
+    )
+}
+
+```
+
 
 ## 6. Monthly Rebalancing & Full Backtest
 
