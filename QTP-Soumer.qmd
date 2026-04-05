@@ -46,6 +46,7 @@ library(doParallel)
 library(foreach)
 library(parallel)
 library(gt)
+library(patchwork)
 ```
 
 
@@ -73,6 +74,8 @@ XLRE_inception <- as.Date("2015-10-07")
 + The universe consists of 11 sector ETFs plus SPY as both benchmark and tradeable asset. XLC (Communication Services) is only available from June 2018 and XLRE (Real Estate) from October 2015. Pairs involving these tickers are excluded before their inception dates.
 
 ```{r}
+#| label: etfs-info-table
+#| 
 tickers <- c("SPY","XLB","XLC","XLE","XLF","XLI","XLK","XLP","XLRE","XLV","XLU","XLY")
 
 ticker_info <- tibble::tibble(
@@ -224,6 +227,8 @@ compute_pair_feats_monthEnd <- function(pairs, month_end, wide_prices){
 ```
 
 ```{r}
+#| label: month-end-feats
+
 cl <- parallel::makeCluster(parallel::detectCores() - 1)
 doParallel::registerDoParallel(cl)
 
@@ -256,9 +261,111 @@ features_clean <- features_list %>%
 
 ### 3.2 Train/Test Split & Feature Normalization
 
+```{r}
+#| label: tidymodels-recipe
+
+features_train <- features_clean %>%
+  dplyr::filter(date <= train_end)
+
+features_test <- features_clean %>%
+  dplyr::filter(date >= test_start)
+
+
+norm_recipe <- recipes::recipe(
+  ~ half_life + hurst + spread_vol,
+  data = features_train
+) %>%
+  recipes::step_normalize(recipes::all_numeric_predictors()) %>%
+  recipes::prep()
+
+train_baked <- recipes::bake(norm_recipe, features_train) %>%
+  dplyr::bind_cols(features_train %>% dplyr::select(pair_id, date))
+
+test_baked <- recipes::bake(norm_recipe, features_test) %>%
+  dplyr::bind_cols(features_test %>% dplyr::select(pair_id, date))
+```
+
+
 ### 3.3 Clustering: K Selection
 
+```{r}
+#| label: selecting-K
+
+last_train_month <- max(features_train$date) # use last month of training - arbitrary
+
+feat_snapshot <- train_baked %>%
+  dplyr::filter(date == last_train_month) %>%
+  dplyr::select(half_life, hurst, spread_vol)
+
+feat_matrix <- as.matrix(feat_snapshot)
+
+k_results <- tibble::tibble(k = k_min:k_max+1) %>%
+  dplyr::mutate(
+    km_fit = purrr::map(k, ~ kmeans(feat_matrix, centers = .x, nstart = 25, iter.max = 100)),
+    
+    wss = purrr::map_dbl(km_fit, ~ .x$tot.withinss),
+    
+    sil_km = purrr::map_dbl(k, function(kk) {
+      
+      km <- kmeans(feat_matrix, centers = kk, nstart = 25, iter.max = 100)
+      if (nrow(feat_matrix) <= kk) return(NA_real_)
+      mean(cluster::silhouette(km$cluster, dist(feat_matrix))[, 3])
+    })
+    ,
+    sil_hc = purrr::map_dbl(k, function(kk) {
+      hc <- hclust(dist(feat_matrix), method = "ward.D2")
+      cl <- cutree(hc, k = kk)
+      if (nrow(feat_matrix) <= kk) return(NA_real_) #had to add safeguard here
+      mean(cluster::silhouette(cl, dist(feat_matrix))[, 3])
+    })
+  )
+
+k_results <- k_results %>%
+  dplyr::mutate(avg_sil = (sil_km + sil_hc) / 2)
+
+optimal_k <- k_results %>% # max average k-means and h-clustering silhoutte
+  dplyr::slice_max(avg_sil, n = 1) %>%
+  dplyr::pull(k)
+
+p_elbow <- ggplot(k_results, aes(x = k, y = wss)) + # elbow graph for presentation
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = optimal_k, linetype = "dashed", color = "red") +
+  labs(title = "Elbow Method", x = "k", y = "Total WSS") +
+  theme_minimal()
+
+p_sil <- k_results %>%
+  tidyr::pivot_longer(cols = c(sil_km, sil_hc), names_to = "method",
+                      values_to = "silhouette") %>%
+  dplyr::mutate(method = ifelse(method == "sil_km", "K-Means", "Hierarchical")) %>%
+  ggplot(aes(x = k, y = silhouette, color = method)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = optimal_k, linetype = "dashed", color = "red") +
+  labs(title = "Silhouette Score", x = "k", y = "Avg Silhouette Width") +
+  theme_minimal()
+
+p_elbow / p_sil
+
+
+```
+
+
 ### 3.4 Tradeable Cluster Selection Function
+
++ The tradeable cluster is defined as the one whose centroid has the lowest combined rank of half-life and Hurst exponent. Low half-life means fast reversion; low Hurst (< 0.5) means mean-reverting structure. This function is called monthly during backtesting
+
+
+```{r}
+#| label: Cluster-selection
+
+
+
+```
+
+
+
+
 
 ### 3.5 Cluster Visualization
 
