@@ -57,5 +57,6 @@ rsconnect/
 # Project-specific ignores
 .claude/
 QTP-Soumer_files/
+claude-macro-rotation-experiment_files/
 2026-04-04-qtp-design.md
 R/
