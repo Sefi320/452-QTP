@@ -48,6 +48,7 @@ library(parallel)
 library(gt)
 library(patchwork)
 library(dlm)
+library(PerformanceAnalytics)
 ```
 
 
@@ -519,15 +520,18 @@ fit_kalman_pair <- function(y, X, train_end_pos = NULL) {
   y_train <- y[1:train_end_pos]
   X_train <- X[1:train_end_pos]
 
-  init_parm <- c(log(var(y_train, na.rm = TRUE)), log(0.01), log(0.01)) 
-  # giving it starting values to find dv and dW (basically works the same way as solver - using MLE)
+  # small init state noise biases optimizer toward smoother beta paths
+  init_parm <- c(log(var(y_train, na.rm = TRUE)), log(1e-4), log(1e-4))
 
   fit <- tryCatch(
     dlm::dlmMLE(
-      y     = y_train,
-      parm  = init_parm,
-      build = function(par) build_dlm(par, X_train),
-      control = list(maxit = 500) # limit so it doesnt run forever if it cant converge
+      y      = y_train,
+      parm   = init_parm,
+      build  = function(par) build_dlm(par, X_train),
+      method = "L-BFGS-B",
+      lower  = c(-Inf, -20, -20),
+      upper  = c( Inf,  -4,  -4),  # cap state noise at exp(-4) ≈ 0.018 to prevent beta_t drift
+      control = list(maxit = 500)
     ),
     error = function(e) NULL
   )
@@ -537,8 +541,8 @@ fit_kalman_pair <- function(y, X, train_end_pos = NULL) {
   mod  <- build_dlm(fit$par, X) # using optimal paramters found above
   filt <- dlm::dlmFilter(y, mod) # this runs on all data - including testing, but using params from training
 
-  beta_t  <- as.numeric(filt$m[-1, 1])
-  alpha_t <- as.numeric(filt$m[-1, 2])
+  alpha_t <- as.numeric(filt$m[-1, 1])  # intercept is column 1 in dlmModReg
+  beta_t  <- as.numeric(filt$m[-1, 2])  # hedge ratio is column 2
   spread  <- y - beta_t * X - alpha_t # this is the dynamic spread built from the output of filtering
 
   # Innovations (one-step prediction errors)
@@ -588,7 +592,7 @@ generate_signals <- function(kf_result, entry_thresh = entry_zscore,
       innov_roll_sd = slider::slide_dbl(
         abs(innov), sd, .before = roll_sd_window - 1, .complete = TRUE
       ),
-      innov_spike = abs(innov) > (innov_roll_mean + INNOV_MULT * innov_roll_sd)
+      innov_spike = abs(innov) > (innov_roll_mean + innov_mult * innov_roll_sd)
     )
 }
 
@@ -604,35 +608,6 @@ generate_signals <- function(kf_result, entry_thresh = entry_zscore,
 + Three exit conditions govern position closure. Take-profit triggers when the spread returns to the Kalman Filter mean estimate (z-score crosses zero). The time stop exits after `2 * half_life` days regardless of P&L, preventing capital from being trapped in broken pairs. The innovation override force-exits when the KF prediction errors spike for `max_innov_days` consecutive days, signaling a structural break in the pair relationship.
 
 
-```{r}
-#| label: exit-rules
-
-apply_exit_rules <- function(signal_df, half_life_days) {
-  # signal_df has z_score, innov_spike, and trade signals
-  # Returns a tibble with final position accounting for exits
-
-  time_stop_days <- max(round(2 * half_life_days), 5) # gives at least a trading week for each trade in case very short half-life
-
-  signal_df %>%
-    dplyr::mutate(
-      # Raw signal from z-score
-      raw_signal = dplyr::case_when(
-        is.na(z_score) ~ 0L,
-        z_score < -entry_thresh ~ 1L,    # spread negative > long pair
-        z_score > entry_thresh  ~ -1L,   # spread positive > short pair
-        TRUE ~ 0L
-      ),
-      innov_consec = slider::slide_dbl(
-        as.numeric(innov_spike),
-        sum, .before = N_INNOV_DAYS - 1, .complete = TRUE
-      ),
-      innov_override = dplyr::coalesce(innov_consec >= max_innov_days, FALSE)
-    )
-}
-
-```
-
-
 ## 6. Monthly Rebalancing & Full Backtest
 
 ### 6.1 Backtesting
@@ -641,59 +616,363 @@ apply_exit_rules <- function(signal_df, half_life_days) {
 
 
 ```{r}
+#| label: backtest-function
+#| cache: true
+run_backtest <- function(pw, pair_grid, feat_data_raw, feat_data_norm,
+                           norm_rec, k, entry_thresh = entry_zscore,
+                           dd_threshold = NULL,
+                           start_date, end_date) {
 
-backtest <- function(){
-  
-  # pull end of month dates for clustering rebalance
-  
-  # for first month of trading, pull last month's end date to have an initial cluster to    trade on
-  
-  # perform clustering at each month end - use function from earlier to choose tradeable    pairs
-  
-  # fit KF on tradeable pairs for each month and generate trade signals
-    # KF has a warmup period so that we ensure it's initialization for the first month
-      # is stable 
-    # this must be done recursively, (for loop) because each day's trade decision depends       on last day's signal and trade
-  
-  # After signals are generated, add the safeguards:
-    # z-score - if z score crosses 0 then exit because the spread mean-reverted
-    # days_in_trade - if we hold a trade for more than 2*half_life that means it should've       # mean reverted by now so we exit regardless of price
-  
-    # Innovations - if innovations(errors) from KF fit are unusually large, that means          # that the relationship broke and a structural chg happened. So we exit to cut            # losses - could also mean we cut gains
-  
-  # To compute returns from trades, we assume that p1 is always long and p2 is always         short
-    # The relationship is derived from the beta from the dynamic model fit from before
-    # We weight each position by its inverse volatility (this ensures no single pair is
-      # overweighted and that we dont cluster our risk)
-    # if position yesterday was 1 (long) that means we are long p1 and short p2
-    # if positions yesterday was -1 (short) that mean we short p1 and long p2
-      # the return formula stays the same, the position sign filps it from long to short
-  
-  # Returns are calculated using yesterday's position * today's Cl-Cl return
-  
-  # All Trades/entry/exit are decided at close of each day, and executed at next open
-  
-  # get cum returns 
-  
-  
-}
+    cl <- parallel::makeCluster(parallel::detectCores() - 1)
+    doParallel::registerDoParallel(cl)
+    on.exit(parallel::stopCluster(cl))
 
+    trading_dates <- pw %>%
+      dplyr::filter(date >= start_date, date <= end_date) %>%
+      dplyr::pull(date) %>%
+      sort()
+
+    month_ends_bt <- pw %>%
+      dplyr::filter(date >= start_date - 60, date <= end_date) %>%
+      dplyr::mutate(ym = format(date, "%Y-%m")) %>%
+      dplyr::group_by(ym) %>%
+      dplyr::slice_max(date, n = 1) %>%
+      dplyr::ungroup() %>%
+      dplyr::pull(date) %>%
+      sort()
+
+    pre_start_months <- month_ends_bt[month_ends_bt < start_date]
+    in_range_months  <- month_ends_bt[month_ends_bt >= start_date & month_ends_bt <=
+  end_date]
+    rebal_dates      <- c(tail(pre_start_months, 1), in_range_months)
+
+    daily_results <- tibble::tibble(
+      date     = trading_dates,
+      port_ret = 0
+    )
+
+    current_pairs <- NULL
+
+    for (rd in seq_along(rebal_dates)) {
+      rebal_date <- rebal_dates[rd]
+      next_rebal <- if (rd < length(rebal_dates)) rebal_dates[rd + 1] else end_date
+
+      feat_raw_month  <- feat_data_raw  %>% dplyr::filter(date == rebal_date)
+      feat_norm_month <- feat_data_norm %>% dplyr::filter(date == rebal_date)
+
+      if (nrow(feat_raw_month) < k || nrow(feat_norm_month) < k) next
+
+      feat_combined <- feat_raw_month %>%
+        dplyr::inner_join(
+          feat_norm_month %>%
+            dplyr::rename(half_life_norm = half_life, hurst_norm = hurst,
+                          spread_vol_norm = spread_vol),
+          by = c("pair_id", "date")
+        )
+
+      cl_result <- select_tradeable_pairs(feat_combined, k, top_pairs)
+      if (is.null(cl_result)) next
+
+      current_pairs <- cl_result$tradeable
+
+      month_dates <- trading_dates[trading_dates > rebal_date &
+                                   trading_dates <= next_rebal]
+      if (length(month_dates) == 0) next
+
+      # Portfolio drawdown circuit breaker: pause new entries if drawdown exceeds threshold
+      if (!is.null(dd_threshold) && any(daily_results$port_ret != 0)) {
+        cum_rets   <- cumprod(1 + daily_results$port_ret)
+        current_dd <- (tail(cum_rets, 1) - max(cum_rets)) / max(cum_rets)
+        if (current_dd < dd_threshold) next
+      }
+
+      kf_lookback <- 252L
+      kf_start    <- max(1L, which(pw$date <= rebal_date) %>% max() - kf_lookback)
+
+      # Parallel pair loop — each worker returns month_rets or NULL
+      pair_rets_list <- foreach::foreach(
+        i = seq_len(nrow(current_pairs)),
+        .packages = c("dplyr", "tidyr", "dlm", "slider", "tibble"),
+        .export  = c("fit_kalman_pair", "generate_signals", "build_dlm",
+                     "innov_mult", "max_innov_days"),
+        .errorhandling = "remove"
+      ) %dopar% {
+
+        pair_info <- current_pairs[i, ]
+        legs <- strsplit(pair_info$pair_id, "_")[[1]]
+        leg1 <- legs[1]; leg2 <- legs[2]
+
+        pair_prices <- pw %>%
+          dplyr::slice(kf_start:nrow(pw)) %>%
+          dplyr::filter(date <= next_rebal) %>%
+          dplyr::select(date, p1 = dplyr::all_of(leg1), p2 = dplyr::all_of(leg2)) %>%
+          tidyr::drop_na() %>%
+          dplyr::mutate(
+            p1_ret = p1 / dplyr::lag(p1) - 1,
+            p2_ret = p2 / dplyr::lag(p2) - 1
+          )
+
+        if (nrow(pair_prices) < 252) return(NULL)
+
+        training_end <- max(which(pair_prices$date <= rebal_date))
+
+        kf_out <- fit_kalman_pair(
+          y             = pair_prices$p1,
+          X             = pair_prices$p2,
+          train_end_pos = training_end
+        )
+
+        if (is.null(kf_out)) return(NULL)
+
+        kf_out$date <- pair_prices$date
+
+        kf_signals <- generate_signals(kf_out, entry_thresh = entry_thresh)
+
+        half_life_val <- pair_info$half_life
+        if (is.na(half_life_val) || half_life_val <= 0) half_life_val <- 20
+
+        time_stop_days <- max(round(2 * half_life_val), 5)
+
+        kf_signals <- kf_signals %>%
+          dplyr::mutate(
+            raw_signal = dplyr::case_when(
+              is.na(z_score)          ~ 0L,
+              z_score < -entry_thresh ~ 1L,
+              z_score >  entry_thresh ~ -1L,
+              TRUE                    ~ 0L
+            ),
+            innov_consec = slider::slide_dbl(
+              as.numeric(dplyr::coalesce(innov_spike, FALSE)),
+              sum, .before = max_innov_days - 1, .complete = TRUE
+            ),
+            innov_override = dplyr::coalesce(innov_consec >= max_innov_days, FALSE)
+          )
+
+        n_sig         <- nrow(kf_signals)
+        position      <- rep(0L, n_sig)
+        days_in_trade <- rep(0L, n_sig)
+
+        for (t in 2:n_sig) {
+          prev_pos <- position[t - 1]
+          sig      <- kf_signals$raw_signal[t]
+
+          if (prev_pos != 0) {
+            days_in_trade[t] <- days_in_trade[t - 1] + 1L
+
+            z_now       <- kf_signals$z_score[t]
+            take_profit <- !is.na(z_now) && (
+              (prev_pos > 0 && z_now >= 0) || (prev_pos < 0 && z_now <= 0)
+            )
+            time_stop  <- days_in_trade[t] > time_stop_days
+            innov_exit <- isTRUE(kf_signals$innov_override[t])
+
+            if (take_profit || time_stop || innov_exit) {
+              position[t]      <- 0L
+              days_in_trade[t] <- 0L
+              next
+            }
+
+            position[t] <- prev_pos
+          } else {
+            if (!is.na(sig) && sig != 0) {
+              position[t]      <- sig
+              days_in_trade[t] <- 1L
+            }
+          }
+        }
+
+        kf_signals$position <- position
+
+        kf_signals <- kf_signals %>%
+          dplyr::left_join(
+            pair_prices %>% dplyr::select(date, p1_ret, p2_ret),
+            by = "date"
+          ) %>%
+          dplyr::mutate(
+            pair_ret = dplyr::lag(position) * (p1_ret - dplyr::lag(beta_t) * p2_ret),
+          pair_ret = pmax(pmin(pair_ret, 0.25), -0.25)
+          )
+
+        kf_signals %>%
+          dplyr::filter(date %in% month_dates) %>%
+          dplyr::select(date, pair_ret) %>%
+          dplyr::mutate(pair_ret = dplyr::coalesce(pair_ret, 0) * pair_info$weight)
+      }
+
+      # Aggregate all pair contributions for this month into daily_results
+      valid_rets <- Filter(function(x) is.data.frame(x) && nrow(x) > 0, pair_rets_list)
+      if (length(valid_rets) == 0) next
+
+      month_contributions <- dplyr::bind_rows(valid_rets) %>%
+        dplyr::group_by(date) %>%
+        dplyr::summarise(port_ret_add = sum(pair_ret, na.rm = TRUE), .groups = "drop")
+
+      daily_results <- daily_results %>%
+        dplyr::left_join(month_contributions, by = "date") %>%
+        dplyr::mutate(
+          port_ret = port_ret + dplyr::coalesce(port_ret_add, 0)
+        ) %>%
+        dplyr::select(-port_ret_add)
+    }
+
+    daily_results %>%
+      dplyr::mutate(cumeq = cumprod(1 + port_ret))
+  }
+
+  # Run backtest on training period
+  train_results <- run_backtest(
+    pw = dat_wide,
+    pair_grid = pair_grid,
+    feat_data_raw = features_clean,
+    feat_data_norm = train_baked %>%
+      dplyr::rename(half_life = half_life, hurst = hurst, spread_vol = spread_vol),
+    norm_rec = norm_recipe,
+    k = optimal_k,
+    entry_thresh = entry_zscore,
+    start_date = train_start,
+    end_date = train_end
+  )
 
 ```
 
 
-## 7. Parameter Optimization
+## 7. Performance Analysis
 
-### 7.1 Grid Search
+### 7.1 Backtest Runs
 
-## 8. Performance Results
+```{r}
+#| label: backtest-test
+#| cache: true
 
-### 8.1 Training Period Performance
+test_results <- run_backtest(
+  pw             = dat_wide,
+  pair_grid      = pair_grid,
+  feat_data_raw  = features_clean,
+  feat_data_norm = test_baked,
+  norm_rec       = norm_recipe,
+  k              = optimal_k,
+  entry_thresh   = entry_zscore,
+  start_date     = test_start,
+  end_date       = test_end
+)
+```
 
-### 8.2 Test Period Performance
+### 7.2 Performance Metrics
 
-### 8.3 RTL Trade Statistics
+```{r}
+#| label: performance-metrics
 
-### Performance Visualized
+spy_prices_full <- dat_raw %>%
+  dplyr::filter(ticker == "SPY") %>%
+  dplyr::select(date, price) %>%
+  dplyr::mutate(spy_ret = price / dplyr::lag(price) - 1)
 
-## 9. Learnings
+tr_xts <- train_results %>% dplyr::select(date, port_ret) %>% timetk::tk_xts(date_var = date)
+te_xts <- test_results  %>% dplyr::select(date, port_ret) %>% timetk::tk_xts(date_var = date)
+
+spy_tr_xts <- spy_prices_full %>%
+  dplyr::filter(date >= train_start, date <= train_end) %>%
+  timetk::tk_xts(date_var = date)
+
+spy_te_xts <- spy_prices_full %>%
+  dplyr::filter(date >= test_start, date <= test_end) %>%
+  timetk::tk_xts(date_var = date)
+
+tibble::tibble(
+  Period         = c("Training", "Test"),
+  `Cum. Return`  = c(tail(train_results$cumeq,1)-1, tail(test_results$cumeq,1)-1),
+  `Sharpe`       = c(SharpeRatio(tr_xts, annualize=TRUE)[1], SharpeRatio(te_xts, annualize=TRUE)[1]),
+  `Omega Sharpe` = c(OmegaSharpeRatio(as.ts(tr_xts), MAR=0), OmegaSharpeRatio(as.ts(te_xts), MAR=0)),
+  `Max Drawdown` = c(maxDrawdown(tr_xts), maxDrawdown(te_xts)),
+  `SPY Corr`     = c(cor(tr_xts, spy_tr_xts, use="complete.obs")[1,2],
+                     cor(te_xts, spy_te_xts, use="complete.obs")[1,2])
+) %>%
+  gt::gt() %>%
+  gt::tab_header(title = "Strategy Performance vs SPY") %>%
+  gt::fmt_percent(columns = c(`Cum. Return`, `Max Drawdown`), decimals = 1) %>%
+  gt::fmt_number(columns = c(Sharpe, `Omega Sharpe`, `SPY Corr`), decimals = 3) %>%
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  )
+```
+
+### 7.3 Equity Curves
+
+
+
+```{r}
+#| label: equity-curves-test
+
+spy_test <- spy_prices_full %>%
+  dplyr::filter(date >= test_start, date <= test_end) %>%
+  dplyr::mutate(cumeq = cumprod(1 + tidyr::replace_na(spy_ret, 0)))
+
+dplyr::bind_rows(
+  test_results %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Strategy"),
+  spy_test     %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(values = c("Strategy" = "black", "SPY" = "firebrick")) +
+  ggplot2::labs(title = "Test Period: Strategy vs SPY", x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+```{r}
+#| label: equity-curves-train
+
+spy_train <- spy_prices_full %>%
+  dplyr::filter(date >= train_start, date <= train_end) %>%
+  dplyr::mutate(cumeq = cumprod(1 + tidyr::replace_na(spy_ret, 0)))
+
+dplyr::bind_rows(
+  train_results %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Strategy"),
+  spy_train     %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(values = c("Strategy" = "black", "SPY" = "firebrick")) +
+  ggplot2::labs(title = "Training Period: Strategy vs SPY", x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+### 7.4 Sensitivity: Excluding the 2020 COVID Shock
+
++ The COVID crash (February–June 2020) was an extreme systemic event where all sector ETFs fell simultaneously, violating the mean-reversion assumption across all pairs at once. The following shows what the training period equity curve would look like had the strategy been paused during this window.
+
+```{r}
+#| label: no2020
+
+train_results_no2020 <- train_results %>%
+  dplyr::mutate(
+    port_ret = ifelse(date >= as.Date("2020-02-20") & date <= as.Date("2020-06-30"), 0, port_ret),
+    cumeq    = cumprod(1 + port_ret)
+  )
+
+dplyr::bind_rows(
+  train_results        %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Strategy"),
+  train_results_no2020 %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Strategy (ex-2020)"),
+  spy_train            %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(
+    values = c("Strategy" = "black", "Strategy (ex-2020)" = "steelblue", "SPY" = "firebrick")
+  ) +
+  ggplot2::labs(title = "Training Period: Impact of 2020 COVID Shock",
+                x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+## 8. Learnings
+
++ **Market neutrality holds in training but breaks in the test period.** The strategy achieved near-zero SPY correlation (-0.030) during training, confirming the pairs construction produces genuinely market-neutral exposures. However, correlation rose to 0.364 in the test period, driven by the April 2025 tariff shock which caused all sector ETFs to move together — collapsing the cross-sectional dispersion that pairs trading requires.
+
++ **The strategy fails to generate positive alpha.** Negative Sharpe and Omega Sharpe ratios in both periods indicate the strategy loses money on a risk-adjusted basis. The training period cumulative loss of -31.8% stems primarily from a sustained post-2010 decline as sector ETF correlations tightened in the low-volatility regime. The strategy works best in high-dispersion environments (2008) and struggles in trending, correlated markets.
+
++ **Systemic shocks overwhelm pair-level exit rules.** The innovation override and time stop are designed for gradual structural breaks within individual pairs. During COVID (March 2020) and the 2025 tariff shock, the breakdown was simultaneous across all pairs and faster than daily-frequency rules can respond. A portfolio-level drawdown circuit breaker was explored but did not improve results materially — the losses were too persistent for a threshold-based halt to be effective.
+
++ **KF beta instability was a significant implementation challenge.** The DLM state vector column ordering (intercept first, slope second) was initially inverted, causing the hedge ratio to be estimated at 30–370x its true value and producing extreme position sizes. Constraining the MLE optimizer (L-BFGS-B with upper bounds on state noise) and correcting the column assignment resolved this. Future implementations should validate beta estimates against OLS as a sanity check before trading.
+
++ **Return computation uses adjusted close-to-close prices throughout.** A more precise implementation would distinguish entry days (open price) from hold days (close-to-close), consistent with the actual execution assumption. At daily frequency the impact is small but non-zero, and represents a known limitation of the current backtest.
