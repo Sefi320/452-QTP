@@ -1,0 +1,789 @@
+---
+title: "Macro Regime-Adaptive Sector Rotation"
+subtitle: "FIN 452 — Supplementary Strategy"
+author: "Claude Code"
+date: "`r Sys.Date()`"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    theme: flatly
+    fig-width: 10
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+## 1. Strategy Overview
+
+The pairs trading strategy in the main document assumes sector ETF spreads mean-revert. This assumption breaks down when macro regimes shift — which is precisely what caused most of its losses. This strategy flips the logic: instead of betting *against* macro-driven sector divergence, it bets *with* it.
+
+The economic cycle rotates through regimes (expansion, peak, contraction, recovery). Each regime has historically favoured specific sectors. This strategy uses k-means clustering on six macroeconomic indicators to classify the current month's regime, then allocates to the sectors that have historically outperformed in that regime. Long-only, monthly rebalancing, no shorting.
+
+**Why this should beat SPY on a risk-adjusted basis:**
+
+- Rotating into defensives (XLP, XLV, XLU) before recessions reduces drawdown
+- Rotating into cyclicals (XLK, XLY, XLF) during expansions captures sector leadership
+- The momentum filter prevents entering sectors in structural downtrends
+- Long-only means no borrow costs, no KF instability, no margin requirements
+
+```{r}
+#| label: libraries
+
+library(tidyverse)
+library(tidyquant)
+library(cluster)
+library(PerformanceAnalytics)
+library(gt)
+library(patchwork)
+library(slider)
+library(timetk)
+```
+
+```{r}
+#| label: parameters
+
+train_start    <- as.Date("2000-06-01")
+train_end      <- as.Date("2024-12-31")
+test_start     <- as.Date("2025-01-01")
+test_end       <- as.Date("2026-03-31")
+
+top_n_sectors  <- 4L    # sectors to hold simultaneously
+mom_window     <- 10L   # months for momentum filter (price > N-month SMA)
+vol_window     <- 3L    # months of history for volatility weighting
+min_hist_months <- 24L  # minimum macro history before trading begins
+k_min          <- 2L
+k_max          <- 8L
+
+XLC_inception  <- as.Date("2018-06-19")
+XLRE_inception <- as.Date("2015-10-07")
+
+tickers        <- c("SPY","XLB","XLC","XLE","XLF","XLI","XLK","XLP","XLRE","XLV","XLU","XLY")
+sector_tickers <- setdiff(tickers, "SPY")
+```
+
+## 2. Data
+
+### 2.1 ETF Prices
+
+```{r}
+#| label: etf-data
+
+etf_raw <- tidyquant::tq_get(
+  tickers,
+  get  = "stock.prices",
+  from = "1999-01-01",
+  to   = test_end + 1
+) %>%
+  dplyr::select(date, symbol, adjusted) %>%
+  dplyr::rename(ticker = symbol, price = adjusted)
+
+# Daily wide format with returns
+etf_daily_wide <- etf_raw %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::mutate(ret = price / dplyr::lag(price) - 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(date, ticker, ret) %>%
+  tidyr::pivot_wider(names_from = ticker, values_from = ret) %>%
+  dplyr::arrange(date)
+
+# Monthly prices (month-end) for momentum filter
+etf_price_monthly <- etf_raw %>%
+  dplyr::mutate(ym = format(date, "%Y-%m")) %>%
+  dplyr::group_by(ticker, ym) %>%
+  dplyr::slice_max(date, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(ticker, date)
+
+etf_price_monthly_wide <- etf_price_monthly %>%
+  dplyr::select(ticker, date, price) %>%
+  tidyr::pivot_wider(names_from = ticker, values_from = price) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(ym = format(date, "%Y-%m"))
+
+# Monthly returns
+etf_ret_monthly_wide <- etf_price_monthly %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::mutate(ret = price / dplyr::lag(price) - 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(ticker, date, ret) %>%
+  tidyr::pivot_wider(names_from = ticker, values_from = ret) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(ym = format(date, "%Y-%m"))
+
+spy_daily <- etf_raw %>%
+  dplyr::filter(ticker == "SPY") %>%
+  dplyr::mutate(spy_ret = price / dplyr::lag(price) - 1) %>%
+  dplyr::select(date, price, spy_ret)
+```
+
+### 2.2 Macro Indicators (FRED)
+
+Six macroeconomic series are loaded via the FRED API through `tidyquant`. Together they characterise the current economic regime across four dimensions: credit conditions, growth momentum, labour market health, and inflation.
+
+```{r}
+#| label: macro-data
+
+macro_ids <- c(
+  "T10Y2Y",        # Yield curve: 10Y minus 2Y treasury spread — leading recession indicator
+  "BAMLH0A0HYM2",  # HY credit spread (OAS) — risk appetite / financial stress
+  "VIXCLS",        # VIX — equity market fear
+  "UNRATE",        # Unemployment rate — labour market health
+  "CPIAUCSL",      # CPI — inflation level
+  "INDPRO"         # Industrial production index — real economic activity
+)
+
+macro_raw <- tidyquant::tq_get(
+  macro_ids,
+  get  = "economic.data",
+  from = "1998-01-01",
+  to   = test_end + 1
+)
+
+# Convert all series to monthly (month-end value; VIX uses monthly average)
+macro_monthly_long <- dplyr::bind_rows(
+  # VIX: monthly average
+  macro_raw %>%
+    dplyr::filter(symbol == "VIXCLS") %>%
+    dplyr::mutate(ym = format(date, "%Y-%m")) %>%
+    dplyr::group_by(symbol, ym) %>%
+    dplyr::summarise(date = max(date), value = mean(price, na.rm = TRUE), .groups = "drop"),
+  # All others: month-end value
+  macro_raw %>%
+    dplyr::filter(symbol != "VIXCLS") %>%
+    dplyr::mutate(ym = format(date, "%Y-%m")) %>%
+    dplyr::group_by(symbol, ym) %>%
+    dplyr::slice_max(date, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::rename(value = price) %>%
+    dplyr::select(symbol, ym, date, value)
+)
+
+# Build feature matrix — pivot on ym only (FRED series have different publication dates
+# within the same month, so pivoting on date + ym creates separate rows per series)
+macro_month_dates <- macro_monthly_long %>%
+  dplyr::group_by(ym) %>%
+  dplyr::summarise(date = max(date), .groups = "drop")
+
+macro_features <- macro_monthly_long %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = value, id_cols = ym) %>%
+  dplyr::left_join(macro_month_dates, by = "ym") %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(
+    # Unemployment: 3-month change (rising = deterioration)
+    unrate_chg3  = UNRATE - dplyr::lag(UNRATE, 3),
+    # CPI: 12-month YoY change
+    cpi_yoy      = CPIAUCSL / dplyr::lag(CPIAUCSL, 12) - 1,
+    # Industrial production: 3-month % change
+    indpro_chg3  = INDPRO / dplyr::lag(INDPRO, 3) - 1
+  ) %>%
+  dplyr::select(
+    date, ym,
+    yield_curve  = T10Y2Y,
+    hy_spread    = BAMLH0A0HYM2,
+    vix          = VIXCLS,
+    unrate_chg3,
+    cpi_yoy,
+    indpro_chg3
+  ) %>%
+  tidyr::drop_na()
+
+macro_feature_cols <- c("yield_curve", "hy_spread", "vix", "unrate_chg3", "cpi_yoy", "indpro_chg3")
+```
+
+```{r}
+#| label: macro-viz
+
+macro_features %>%
+  dplyr::filter(date >= train_start, date <= test_end) %>%
+  tidyr::pivot_longer(cols = all_of(macro_feature_cols), names_to = "indicator", values_to = "value") %>%
+  dplyr::mutate(indicator = dplyr::recode(indicator,
+    yield_curve  = "Yield Curve (10Y-2Y)",
+    hy_spread    = "HY Credit Spread",
+    vix          = "VIX",
+    unrate_chg3  = "Unemployment Change (3M)",
+    cpi_yoy      = "CPI YoY",
+    indpro_chg3  = "Industrial Production Change (3M)"
+  )) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = value)) +
+  ggplot2::geom_line(linewidth = 0.5, color = "steelblue") +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  ggplot2::facet_wrap(~ indicator, scales = "free_y", ncol = 2) +
+  ggplot2::labs(title = "Macro Indicators (Training + Test)", x = NULL, y = NULL) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(strip.text = ggplot2::element_text(size = 8))
+```
+
+## 3. Regime Classification
+
+### 3.1 Optimal K Selection
+
+K is selected using the average silhouette score across k-means and hierarchical clustering, evaluated on the last month of the training period — the same approach as the main strategy. The macro cycle is theoretically 4-phase (expansion, peak, contraction, recovery), so k = 4 is the prior expectation.
+
+```{r}
+#| label: k-selection
+
+# Use training-period macro data for k selection
+macro_train <- macro_features %>% dplyr::filter(date <= train_end)
+
+last_train_macro <- max(macro_train$date)
+
+# Snapshot at last training month — full history, normalised
+feat_snap <- macro_train %>%
+  dplyr::select(all_of(macro_feature_cols)) %>%
+  scale() %>%
+  as.matrix()
+
+set.seed(42)
+k_results <- tibble::tibble(k = k_min:k_max) %>%
+  dplyr::mutate(
+    sil_km = purrr::map_dbl(k, function(kk) {
+      if (nrow(feat_snap) <= kk) return(NA_real_)
+      km <- kmeans(feat_snap, centers = kk, nstart = 25, iter.max = 200)
+      mean(cluster::silhouette(km$cluster, dist(feat_snap))[, 3])
+    }),
+    sil_hc = purrr::map_dbl(k, function(kk) {
+      if (nrow(feat_snap) <= kk) return(NA_real_)
+      hc  <- hclust(dist(feat_snap), method = "ward.D2")
+      lab <- cutree(hc, k = kk)
+      mean(cluster::silhouette(lab, dist(feat_snap))[, 3])
+    }),
+    avg_sil = (sil_km + sil_hc) / 2
+  )
+
+optimal_k <- k_results %>%
+  dplyr::slice_max(avg_sil, n = 1, with_ties = FALSE) %>%
+  dplyr::pull(k)
+
+k_results %>%
+  tidyr::pivot_longer(cols = c(sil_km, sil_hc), names_to = "method", values_to = "silhouette") %>%
+  dplyr::mutate(method = dplyr::recode(method, sil_km = "K-Means", sil_hc = "Hierarchical")) %>%
+  ggplot2::ggplot(ggplot2::aes(x = k, y = silhouette, color = method)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::geom_vline(xintercept = optimal_k, linetype = "dashed", color = "red") +
+  ggplot2::annotate("text", x = optimal_k + 0.2, y = max(k_results$avg_sil, na.rm = TRUE),
+                    label = paste0("k = ", optimal_k), hjust = 0, color = "red") +
+  ggplot2::labs(title = "Silhouette Score by K", x = "Number of Clusters", y = "Avg Silhouette Width",
+                color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+### 3.2 Regime Characterisation
+
+```{r}
+#| label: regime-characterisation
+
+set.seed(42)
+km_full <- kmeans(feat_snap, centers = optimal_k, nstart = 25, iter.max = 200)
+
+macro_train_labelled <- macro_train %>%
+  dplyr::mutate(regime = km_full$cluster)
+
+# Centroid profile: what does each regime look like?
+regime_profile <- macro_train_labelled %>%
+  dplyr::group_by(regime) %>%
+  dplyr::summarise(
+    n_months    = dplyr::n(),
+    yield_curve = mean(yield_curve, na.rm = TRUE),
+    hy_spread   = mean(hy_spread,   na.rm = TRUE),
+    vix         = mean(vix,         na.rm = TRUE),
+    unrate_chg3 = mean(unrate_chg3, na.rm = TRUE),
+    cpi_yoy     = mean(cpi_yoy,     na.rm = TRUE),
+    indpro_chg3 = mean(indpro_chg3, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  dplyr::mutate(
+    interpretation = dplyr::case_when(
+      hy_spread == min(hy_spread) & vix == min(vix)    ~ "Expansion (low stress, risk-on)",
+      unrate_chg3 == max(unrate_chg3)                   ~ "Contraction (labour deteriorating)",
+      indpro_chg3 == max(indpro_chg3) & yield_curve > 0 ~ "Recovery (activity recovering)",
+      TRUE                                               ~ "Peak / Late Cycle"
+    )
+  )
+
+regime_profile %>%
+  gt::gt() %>%
+  gt::tab_header(title = "Macro Regime Profiles (Training Period)") %>%
+  gt::fmt_number(columns = c(yield_curve, hy_spread, vix, unrate_chg3, cpi_yoy, indpro_chg3), decimals = 2) %>%
+  gt::tab_style(style = gt::cell_text(weight = "bold"), locations = gt::cells_column_labels())
+```
+
+```{r}
+#| label: regime-timeline
+
+macro_train_labelled %>%
+  dplyr::mutate(regime = factor(regime)) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = 1, fill = regime)) +
+  ggplot2::geom_tile(height = 0.8) +
+  ggplot2::scale_fill_brewer(palette = "Set2") +
+  ggplot2::labs(title = "Macro Regime Classification Over Training Period",
+                x = NULL, y = NULL, fill = "Regime") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.y = ggplot2::element_blank(),
+                 axis.ticks.y = ggplot2::element_blank())
+```
+
+## 4. Sector Selection & Weighting
+
+At each month-end rebalancing date, the strategy:
+
+1. Clusters all macro history up to that date (expanding window, re-clustered monthly)
+2. Identifies the current month's regime
+3. Computes average next-month sector returns for each regime using only past data
+4. Selects the top `r top_n_sectors` sectors by expected regime return
+5. Applies a momentum gate: a sector must be above its `r mom_window`-month price SMA to be eligible. If fewer than 2 sectors pass, the filter is relaxed (regime signal dominates)
+6. Weights eligible sectors by inverse 3-month realised volatility
+
+## 5. Backtest
+
+```{r}
+#| label: backtest-function
+#| cache: true
+
+run_rotation_backtest <- function(macro_feats, etf_price_monthly_wide,
+                                   etf_ret_monthly_wide, etf_daily_wide,
+                                   k, top_n, mom_win, vol_win, min_hist,
+                                   start_date, end_date) {
+
+  feature_cols  <- c("yield_curve","hy_spread","vix","unrate_chg3","cpi_yoy","indpro_chg3")
+
+  # Month-end rebalancing dates within the backtest window
+  rebal_dates <- etf_price_monthly_wide %>%
+    dplyr::filter(date >= start_date, date <= end_date) %>%
+    dplyr::pull(date) %>%
+    sort()
+
+  # All trading days in the window
+  trading_days <- etf_daily_wide %>%
+    dplyr::filter(date >= start_date, date <= end_date) %>%
+    dplyr::pull(date) %>%
+    sort()
+
+  # Storage: for each rebal date, store sector weights
+  weights_list <- vector("list", length(rebal_dates))
+
+  for (i in seq_along(rebal_dates)) {
+    t_date <- rebal_dates[i]
+    t_ym   <- format(t_date, "%Y-%m")
+
+    # --- 1. Macro history up to t ---
+    macro_hist <- macro_feats %>% dplyr::filter(date <= t_date)
+    if (nrow(macro_hist) < min_hist) {
+      weights_list[[i]] <- tibble::tibble(rebal_date = t_date)
+      next
+    }
+
+    # --- 2. Normalise and cluster ---
+    feat_mat <- macro_hist %>%
+      dplyr::select(all_of(feature_cols)) %>%
+      scale() %>%
+      as.matrix()
+
+    set.seed(42)
+    km <- kmeans(feat_mat, centers = k, nstart = 25, iter.max = 200)
+
+    n_hist        <- nrow(macro_hist)
+    current_cluster <- km$cluster[n_hist]
+
+    # --- 3. Regime-return mapping (walk-forward: uses only past return observations) ---
+    # Pairs: (cluster at month s) -> (sector return at month s+1)
+    # We have clusters for rows 1..n_hist; returns for rows 1..n_hist in etf_ret_monthly_wide
+    # We use pairs where s in 1..n_hist-1, s+1 in 1..n_hist (all known at time t)
+
+    past_clusters <- km$cluster[-n_hist]                     # cluster at months 1..n-1
+    next_yms      <- macro_hist$ym[-1]                       # ym of months 2..n (the "next month")
+
+    # Available sectors at date t (inception date restrictions)
+    avail_sectors <- sector_tickers[sapply(sector_tickers, function(s) {
+      if (s == "XLC")  return(t_date >= XLC_inception)
+      if (s == "XLRE") return(t_date >= XLRE_inception)
+      TRUE
+    })]
+
+    # Get sector returns for those next months
+    next_month_rets <- etf_ret_monthly_wide %>%
+      dplyr::filter(ym %in% next_yms) %>%
+      dplyr::select(ym, all_of(avail_sectors))
+
+    regime_map_df <- tibble::tibble(ym = next_yms, cluster = past_clusters) %>%
+      dplyr::left_join(next_month_rets, by = "ym")
+
+    # Average sector return per regime (only use current regime)
+    regime_avg <- regime_map_df %>%
+      dplyr::filter(cluster == current_cluster) %>%
+      dplyr::summarise(across(all_of(avail_sectors), \(x) mean(x, na.rm = TRUE)))
+
+    if (ncol(regime_avg) == 0 || all(is.na(regime_avg))) {
+      weights_list[[i]] <- tibble::tibble(rebal_date = t_date)
+      next
+    }
+
+    # Rank sectors by expected return
+    sector_ranking <- regime_avg %>%
+      tidyr::pivot_longer(everything(), names_to = "sector", values_to = "exp_ret") %>%
+      dplyr::arrange(dplyr::desc(exp_ret))
+
+    # --- 4. Momentum filter ---
+    price_hist_for_mom <- etf_price_monthly_wide %>%
+      dplyr::filter(date <= t_date) %>%
+      dplyr::slice_tail(n = mom_win)
+
+    if (nrow(price_hist_for_mom) >= mom_win) {
+      sma10 <- price_hist_for_mom %>%
+        dplyr::select(all_of(avail_sectors)) %>%
+        colMeans(na.rm = TRUE)
+      current_prices <- etf_price_monthly_wide %>%
+        dplyr::filter(date == t_date) %>%
+        dplyr::select(all_of(avail_sectors)) %>%
+        as.numeric()
+      names(current_prices) <- avail_sectors
+      passes_mom <- current_prices > sma10
+    } else {
+      passes_mom <- setNames(rep(TRUE, length(avail_sectors)), avail_sectors)
+    }
+
+    # Select top sectors
+    eligible <- sector_ranking %>%
+      dplyr::mutate(passes_mom = passes_mom[sector]) %>%
+      dplyr::filter(passes_mom) %>%
+      dplyr::slice_head(n = top_n)
+
+    # Relax momentum filter if fewer than 2 sectors pass
+    if (nrow(eligible) < 2) {
+      eligible <- sector_ranking %>% dplyr::slice_head(n = top_n)
+    }
+
+    selected_sectors <- eligible$sector
+
+    # --- 5. Inverse volatility weighting ---
+    price_hist_for_vol <- etf_price_monthly_wide %>%
+      dplyr::filter(date <= t_date) %>%
+      dplyr::slice_tail(n = vol_win + 1)
+
+    if (nrow(price_hist_for_vol) >= 2) {
+      vol_rets <- price_hist_for_vol %>%
+        dplyr::select(all_of(selected_sectors)) %>%
+        dplyr::mutate(across(everything(), \(x) x / dplyr::lag(x) - 1)) %>%
+        dplyr::slice(-1)
+      sector_vols <- sapply(selected_sectors, function(s) sd(vol_rets[[s]], na.rm = TRUE))
+      sector_vols[is.na(sector_vols) | sector_vols == 0] <- 1
+    } else {
+      sector_vols <- setNames(rep(1, length(selected_sectors)), selected_sectors)
+    }
+
+    inv_vol <- 1 / sector_vols
+    weights <- inv_vol / sum(inv_vol)
+
+    wt_row <- tibble::tibble(rebal_date = t_date)
+    for (s in selected_sectors) wt_row[[paste0("w_", s)]] <- weights[s]
+
+    weights_list[[i]] <- wt_row
+  }
+
+  # Combine weights (fill NA for unselected sectors)
+  weight_cols <- paste0("w_", sector_tickers)
+  weights_df <- dplyr::bind_rows(weights_list) %>%
+    dplyr::mutate(across(all_of(intersect(weight_cols, names(.))), \(x) tidyr::replace_na(x, 0)))
+
+  for (wc in weight_cols) {
+    if (!wc %in% names(weights_df)) weights_df[[wc]] <- 0
+  }
+
+  # --- Apply monthly weights to daily returns ---
+  rebal_sorted <- sort(weights_df$rebal_date)
+
+  daily_port <- etf_daily_wide %>%
+    dplyr::filter(date >= start_date, date <= end_date) %>%
+    dplyr::arrange(date) %>%
+    dplyr::mutate(
+      rebal_idx  = findInterval(date, rebal_sorted, left.open = TRUE),
+      rebal_date = dplyr::if_else(rebal_idx == 0L, as.Date(NA), rebal_sorted[pmax(rebal_idx, 1L)])
+    ) %>%
+    dplyr::filter(!is.na(rebal_date)) %>%
+    dplyr::left_join(weights_df, by = "rebal_date") %>%
+    dplyr::mutate(
+      port_ret = purrr::pmap_dbl(
+        dplyr::select(., all_of(weight_cols)),
+        function(...) {
+          wts  <- c(...)
+          rets <- unlist(dplyr::select(dplyr::cur_data(), sub("^w_", "", weight_cols)))
+          sum(wts * tidyr::replace_na(rets, 0), na.rm = TRUE)
+        }
+      )
+    )
+
+  # Cleaner: compute port_ret via matrix multiplication
+  ret_mat <- daily_port %>%
+    dplyr::select(all_of(sub("^w_", "", weight_cols))) %>%
+    as.matrix()
+  ret_mat[is.na(ret_mat)] <- 0
+
+  wt_mat <- daily_port %>%
+    dplyr::select(all_of(weight_cols)) %>%
+    as.matrix()
+  wt_mat[is.na(wt_mat)] <- 0
+
+  port_rets <- rowSums(ret_mat * wt_mat)
+
+  daily_port %>%
+    dplyr::select(date, rebal_date) %>%
+    dplyr::mutate(
+      port_ret = port_rets,
+      cumeq    = cumprod(1 + port_ret)
+    )
+}
+```
+
+```{r}
+#| label: run-train-backtest
+#| cache: true
+
+train_results <- run_rotation_backtest(
+  macro_feats            = macro_features,
+  etf_price_monthly_wide = etf_price_monthly_wide,
+  etf_ret_monthly_wide   = etf_ret_monthly_wide,
+  etf_daily_wide         = etf_daily_wide,
+  k                      = optimal_k,
+  top_n                  = top_n_sectors,
+  mom_win                = mom_window,
+  vol_win                = vol_window,
+  min_hist               = min_hist_months,
+  start_date             = train_start,
+  end_date               = train_end
+)
+```
+
+```{r}
+#| label: run-test-backtest
+#| cache: true
+
+test_results <- run_rotation_backtest(
+  macro_feats            = macro_features,
+  etf_price_monthly_wide = etf_price_monthly_wide,
+  etf_ret_monthly_wide   = etf_ret_monthly_wide,
+  etf_daily_wide         = etf_daily_wide,
+  k                      = optimal_k,
+  top_n                  = top_n_sectors,
+  mom_win                = mom_window,
+  vol_win                = vol_window,
+  min_hist               = min_hist_months,
+  start_date             = test_start,
+  end_date               = test_end
+)
+```
+
+## 6. Performance Results
+
+### 6.1 Metrics
+
+```{r}
+#| label: performance-metrics
+
+tr_xts <- train_results %>%
+  dplyr::select(date, port_ret) %>%
+  timetk::tk_xts(date_var = date)
+
+te_xts <- test_results %>%
+  dplyr::select(date, port_ret) %>%
+  timetk::tk_xts(date_var = date)
+
+spy_tr_xts <- spy_daily %>%
+  dplyr::filter(date >= train_start, date <= train_end) %>%
+  dplyr::select(date, spy_ret) %>%
+  timetk::tk_xts(date_var = date)
+
+spy_te_xts <- spy_daily %>%
+  dplyr::filter(date >= test_start, date <= test_end) %>%
+  dplyr::select(date, spy_ret) %>%
+  timetk::tk_xts(date_var = date)
+
+spy_tr_cum <- spy_daily %>%
+  dplyr::filter(date >= train_start, date <= train_end) %>%
+  dplyr::mutate(cumeq = cumprod(1 + tidyr::replace_na(spy_ret, 0)))
+
+spy_te_cum <- spy_daily %>%
+  dplyr::filter(date >= test_start, date <= test_end) %>%
+  dplyr::mutate(cumeq = cumprod(1 + tidyr::replace_na(spy_ret, 0)))
+
+tibble::tibble(
+  Period         = c("Training", "Test"),
+  `Cum. Return`  = c(tail(train_results$cumeq, 1) - 1, tail(test_results$cumeq, 1) - 1),
+  `Sharpe`       = c(SharpeRatio(tr_xts, annualize = TRUE)[1],
+                     SharpeRatio(te_xts, annualize = TRUE)[1]),
+  `Omega Sharpe` = c(OmegaSharpeRatio(as.ts(tr_xts), MAR = 0),
+                     OmegaSharpeRatio(as.ts(te_xts), MAR = 0)),
+  `Max Drawdown` = c(maxDrawdown(tr_xts), maxDrawdown(te_xts)),
+  `SPY Sharpe`   = c(SharpeRatio(spy_tr_xts, annualize = TRUE)[1],
+                     SharpeRatio(spy_te_xts, annualize = TRUE)[1]),
+  `SPY Corr`     = c(cor(merge(tr_xts, spy_tr_xts, join = "inner"), use = "complete.obs")[1, 2],
+                     cor(merge(te_xts, spy_te_xts, join = "inner"), use = "complete.obs")[1, 2])
+) %>%
+  gt::gt() %>%
+  gt::tab_header(title = "Macro Rotation Strategy vs SPY") %>%
+  gt::fmt_percent(columns = c(`Cum. Return`, `Max Drawdown`), decimals = 1) %>%
+  gt::fmt_number(columns = c(Sharpe, `Omega Sharpe`, `SPY Sharpe`, `SPY Corr`), decimals = 3) %>%
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  )
+```
+
+### 6.2 Equity Curves
+
+```{r}
+#| label: equity-curve-train
+
+dplyr::bind_rows(
+  train_results %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Rotation Strategy"),
+  spy_tr_cum    %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(values = c("Rotation Strategy" = "steelblue", "SPY" = "firebrick")) +
+  ggplot2::labs(title = "Training Period: Macro Rotation vs SPY",
+                x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+```{r}
+#| label: equity-curve-test
+
+dplyr::bind_rows(
+  test_results %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Rotation Strategy"),
+  spy_te_cum   %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(values = c("Rotation Strategy" = "steelblue", "SPY" = "firebrick")) +
+  ggplot2::labs(title = "Test Period: Macro Rotation vs SPY",
+                x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+### 6.3 Drawdown Analysis
+
+```{r}
+#| label: drawdown
+
+p_dd_strat <- PerformanceAnalytics::chart.Drawdown(
+  tr_xts,
+  main     = "Strategy Drawdown (Training)",
+  col      = "steelblue",
+  ylab     = "Drawdown"
+)
+
+p_dd_spy <- PerformanceAnalytics::chart.Drawdown(
+  spy_tr_xts,
+  main = "SPY Drawdown (Training)",
+  col  = "firebrick",
+  ylab = "Drawdown"
+)
+```
+
+### 6.4 Regime Allocation Over Time
+
+```{r}
+#| label: regime-allocation
+
+# Reconstruct monthly weights for visualisation
+rebal_months_train <- etf_price_monthly_wide %>%
+  dplyr::filter(date >= train_start, date <= train_end) %>%
+  dplyr::pull(date)
+
+macro_train_labels_wf <- purrr::map_dfr(rebal_months_train, function(t_date) {
+  macro_hist <- macro_features %>% dplyr::filter(date <= t_date)
+  if (nrow(macro_hist) < min_hist_months) return(NULL)
+
+  feat_mat <- macro_hist %>%
+    dplyr::select(yield_curve, hy_spread, vix, unrate_chg3, cpi_yoy, indpro_chg3) %>%
+    scale() %>% as.matrix()
+
+  set.seed(42)
+  km <- kmeans(feat_mat, centers = optimal_k, nstart = 25, iter.max = 200)
+
+  tibble::tibble(
+    date   = t_date,
+    regime = factor(km$cluster[nrow(macro_hist)])
+  )
+})
+
+macro_train_labels_wf %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = 1, fill = regime)) +
+  ggplot2::geom_tile(height = 0.8) +
+  ggplot2::scale_fill_brewer(palette = "Set2") +
+  ggplot2::labs(title = "Walk-Forward Regime Classification (Training Period)",
+                x = NULL, y = NULL, fill = "Regime") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.y = ggplot2::element_blank(),
+                 axis.ticks.y = ggplot2::element_blank())
+```
+
+## 7. Discussion
+
+**Why this strategy is structured this way:**
+
+The key design choice is using *macro state* rather than *price spread history* to generate signals. The pairs trading strategy in the main document failed because it assumed sector spreads mean-revert — which they do not do during structural macro shifts (QE-driven sector divergence post-2008, tariff shock in 2025). This strategy does not fight macro regimes; it reads them and allocates accordingly.
+
+**The clustering role:** k-means on macro indicators groups months with similar macro environments. The cluster label at time t summarises the current regime without any model assumptions about what each regime means — the data determines the groupings. The regime-return mapping then learns empirically which sectors outperformed historically in each macro state.
+
+**What can still go wrong:**
+
+- **Regime mislabelling:** k-means clustering on expanding data can reassign historical labels as new data arrives. The regime at month t+1 may be classified differently next month when more data is available. The strategy uses only the current labelling, so there is some instability.
+- **Regime transitions:** At the turning point between regimes (e.g., early 2008), the model will lag by one month because it sees the old regime until end-of-month data updates.
+- **Survivorship in sector ETFs:** The composition of each sector ETF changes over time. XLK in 2000 was dominated by telecoms; by 2020 it is Apple and Microsoft. The sector behaviour the model is trained on reflects different underlying stocks.
+- **2025 tariff shock:** A high-VIX, wide-credit-spread month should classify as a contraction regime and rotate into XLP/XLV/XLU. Whether the monthly rebalancing frequency was fast enough to avoid most of the April 2025 drawdown depends on when the macro indicators crossed the regime boundary.
+
+## 8. Lessons Learned
+
+### 8.1 What the Results Actually Show
+
+**Training Sharpe 0.430 vs SPY 0.410 — the outperformance is real but narrow.** The strategy does generate slightly better risk-adjusted returns over the 24-year training period. That is a genuine result: rotating into regime-appropriate sectors produces marginally better outcomes than holding everything equally. But the margin is thin, and the max drawdown of 53.2% shows the strategy still experienced most of SPY's worst periods.
+
+**The test period failure was not random bad luck.** The rotation strategy fell harder than SPY during the April 2025 tariff shock (-20% vs SPY -15%). This happened because the macro clustering classified early 2025 as an expansion regime — low VIX, tight credit spreads, positive industrial production — and rotated into growth sectors (XLK, XLY, XLF). When the tariff shock hit, those sectors fell more than the broad market. A diversified SPY was better protected than a concentrated sector bet. The strategy that was supposed to rotate defensive was pointing the wrong direction.
+
+**SPY correlation of 0.884 exposes the strategy's core limitation.** A long-only sector rotation strategy is always invested in US equities. The "alpha" from rotating between sectors is small relative to the shared beta exposure. In practice, this strategy behaves like SPY with a slight active tilt — not a fundamentally different return stream.
+
+### 8.2 Comparing Both Strategies
+
+| Metric | Pairs Trading | Macro Rotation |
+|---|---|---|
+| Training Sharpe | −0.035 | 0.430 |
+| Test Sharpe | −0.428 | −0.133 |
+| Max Drawdown (Train) | 56.7% | 53.2% |
+| SPY Correlation | −0.030 | 0.884 |
+| Source of edge | Mean-reversion of spreads | Macro regime prediction |
+| Failed because | Structural regime change | Concentration + fast shock |
+
+The pairs strategy is nearly uncorrelated to SPY but lost money. The rotation strategy has high SPY correlation but made money over the training period. Neither is satisfying on its own.
+
+### 8.3 What the Optimal Strategy Looks Like
+
+The results from both strategies point to the same conclusion: **the optimal approach combines them.**
+
+**Core allocation: Macro Rotation (60–70%)**
+
+The rotation strategy generates positive long-run returns with a Sharpe above SPY. It should form the core of the portfolio. Its limitation is high market correlation and concentration risk during fast shocks. Mitigations:
+
+- Increase rebalancing frequency to weekly using weekly macro signals (VIX and credit spreads update daily and can be monitored intra-month)
+- Add a portfolio-level volatility target: when realised 20-day volatility exceeds a threshold, scale down all sector positions and hold SPY as a diversifier
+- Extend to 6 sectors instead of 4 to reduce concentration risk while maintaining the regime signal
+
+**Satellite allocation: Pairs Trading (20–30%)**
+
+The pairs strategy's near-zero SPY correlation (−0.030) is genuinely valuable as a diversifier. Its losses came from the ETF universe being too correlated and from dynamic beta instability. With a better universe (within-sector stock pairs) and a fixed OLS hedge ratio (simpler, more stable), a pairs component could provide truly uncorrelated returns to offset the rotation strategy's market exposure.
+
+**Cash / Volatility Buffer (10%)**
+
+Hold cash or short-term Treasuries. When VIX exceeds a threshold (e.g., 30), temporarily reduce the rotation allocation and hold this buffer. This is the circuit breaker the pairs strategy tried to implement — it works better at the portfolio level than at the individual pair level.
+
+**Why this works:**
+
+The rotation strategy makes money when macro regimes are stable and predictable. The pairs strategy (with a better universe) makes money when individual securities temporarily diverge. These two conditions are not perfectly correlated — there will be periods where one works and the other doesn't. The combination produces a more stable overall return stream than either alone.
+
+The fundamental insight from this project is that no single strategy based on 12 sector ETFs is sufficient. The universe is too small, too correlated, and too exposed to macro shocks to support both a long-short pairs strategy and a long-only rotation strategy at the same time. A production-grade implementation would expand the universe, separate the alpha sources, and manage risk at the portfolio level rather than the strategy level.

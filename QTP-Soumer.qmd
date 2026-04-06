@@ -879,12 +879,12 @@ spy_te_xts <- spy_prices_full %>%
   timetk::tk_xts(date_var = date)
 
 tibble::tibble(
-  Period         = c("Training", "Test"),
-  `Cum. Return`  = c(tail(train_results$cumeq,1)-1, tail(test_results$cumeq,1)-1),
-  `Sharpe`       = c(SharpeRatio(tr_xts, annualize=TRUE)[1], SharpeRatio(te_xts, annualize=TRUE)[1]),
+  Period  = c("Training", "Test"),
+  `Cum. Return` = c(tail(train_results$cumeq,1)-1, tail(test_results$cumeq,1)-1),
+  `Sharpe` = c(SharpeRatio(tr_xts, annualize=TRUE)[1], SharpeRatio(te_xts, annualize=TRUE)[1]),
   `Omega Sharpe` = c(OmegaSharpeRatio(as.ts(tr_xts), MAR=0), OmegaSharpeRatio(as.ts(te_xts), MAR=0)),
   `Max Drawdown` = c(maxDrawdown(tr_xts), maxDrawdown(te_xts)),
-  `SPY Corr`     = c(cor(tr_xts, spy_tr_xts, use="complete.obs")[1,2],
+  `SPY Corr` = c(cor(tr_xts, spy_tr_xts, use="complete.obs")[1,2],
                      cor(te_xts, spy_te_xts, use="complete.obs")[1,2])
 ) %>%
   gt::gt() %>%
@@ -967,12 +967,263 @@ dplyr::bind_rows(
 
 ## 8. Learnings
 
-+ **Market neutrality holds in training but breaks in the test period.** The strategy achieved near-zero SPY correlation (-0.030) during training, confirming the pairs construction produces genuinely market-neutral exposures. However, correlation rose to 0.364 in the test period, driven by the April 2025 tariff shock which caused all sector ETFs to move together — collapsing the cross-sectional dispersion that pairs trading requires.
++ **Market neutrality holds in training but breaks in the test period.** The strategy achieved near-zero SPY correlation (-0.030) during training, confirming the pairs construction produces market-neutral exposures. However, correlation rose to 0.364 in the test period, driven by the April 2025 tariff shock which caused all sector ETFs to move together. I think that this is a good strategy to be combined with a buy and hold strategy. Pairs trading thrives in markets like 2008, where all sectors experienced a shock, but at different times. This created a spread large enough for the strategy to perform well. After 2008, and the 3 rounds of QE, (through 2014 and in 2020) growth sectors like Tech out grew defensive etfs like Utilities. The model read this as a widening spread and because it assumes mean reversion, it held losing positions as this spread widened not due to a jump that will mean revert, but because of a structural change in the market.
 
-+ **The strategy fails to generate positive alpha.** Negative Sharpe and Omega Sharpe ratios in both periods indicate the strategy loses money on a risk-adjusted basis. The training period cumulative loss of -31.8% stems primarily from a sustained post-2010 decline as sector ETF correlations tightened in the low-volatility regime. The strategy works best in high-dispersion environments (2008) and struggles in trending, correlated markets.
 
-+ **Systemic shocks overwhelm pair-level exit rules.** The innovation override and time stop are designed for gradual structural breaks within individual pairs. During COVID (March 2020) and the 2025 tariff shock, the breakdown was simultaneous across all pairs and faster than daily-frequency rules can respond. A portfolio-level drawdown circuit breaker was explored but did not improve results materially — the losses were too persistent for a threshold-based halt to be effective.
++ **Systemic shocks overwhelm pair-level exit rules.** The innovation override and time stop are designed for gradual structural breaks within individual pairs. During COVID (March 2020) and the 2025 tariff shock, the breakdown was simultaneous across all pairs and faster than daily-frequency rules can respond. I explored a portfolio-level drawdown circuit breaker it but did not improve results materially — the losses were too persistent for a threshold-based guard to be effective.
 
-+ **KF beta instability was a significant implementation challenge.** The DLM state vector column ordering (intercept first, slope second) was initially inverted, causing the hedge ratio to be estimated at 30–370x its true value and producing extreme position sizes. Constraining the MLE optimizer (L-BFGS-B with upper bounds on state noise) and correcting the column assignment resolved this. Future implementations should validate beta estimates against OLS as a sanity check before trading.
++ **KF beta instability**  Future implementations should validate beta estimates against OLS as a sanity check before trading. I believe that I over-engineered the beta here, especially because the etfs are closely related and ther are only 11 of them. I think this would work if we had used individual stocks within the same sector, that way they each have unique risk profiles (management, performance, etc..)
 
-+ **Return computation uses adjusted close-to-close prices throughout.** A more precise implementation would distinguish entry days (open price) from hold days (close-to-close), consistent with the actual execution assumption. At daily frequency the impact is small but non-zero, and represents a known limitation of the current backtest.
++ **Return computation uses adjusted close-to-close prices throughout.** I started off using the Op-Cl return but then I realized that some etfs pay higher dividends than others, so I decided to use Adjusted Close prices for all of them and assumed that all signals are generated at close, trades are executed at open. To do this I also assumed that the Op-Cl return will be not significant. I noticed late in the assignment that I could've used adjustOHLC function so I decided to run with what I have and point it out.
+
+
+## Appendix A: Extension to Individual Stocks
+
++ A common critique of sector ETF pairs trading is that the universe is too small and too correlated — all 11 assets track US equities with shared macro drivers. The natural extension is individual stocks, which have idiosyncratic risk factors (earnings, management, competitive position) that could generate more exploitable spread dislocations. This appendix tests that hypothesis by applying the identical strategy — same functions, same parameters, same backtest logic — to 27 large-cap stocks drawn from the nine legacy SPDR sectors, three per sector. The results do not support the hypothesis. Performance is materially worse across all metrics, for reasons discussed in the results section. **Survivorship bias caveat:** all 27 stocks were selected from current S&P 500 constituents. Companies that failed or were delisted between 2000–2024 are excluded, which biases backtest returns upward — meaning the true out-of-sample performance would be even worse.
+
+### A.1 Stock Universe
+
+```{r}
+#| label: stk-universe-table
+
+stk_tickers <- c(
+  "AAPL", "MSFT", "INTC",
+  "JPM",  "BAC",  "WFC",
+  "JNJ",  "PFE",  "ABT",
+  "HD",   "MCD",  "NKE",
+  "PG",   "KO",   "WMT",
+  "NEE",  "DUK",  "SO",
+  "XOM",  "CVX",  "SLB",
+  "GE",   "CAT",  "MMM",
+  "APD",  "NEM",  "ECL"
+)
+
+tibble::tibble(
+  Ticker = stk_tickers,
+  Sector = c(
+    rep("Technology (XLK)", 3),
+    rep("Financials (XLF)", 3),
+    rep("Health Care (XLV)", 3),
+    rep("Consumer Discretionary (XLY)", 3),
+    rep("Consumer Staples (XLP)", 3),
+    rep("Utilities (XLU)", 3),
+    rep("Energy (XLE)", 3),
+    rep("Industrials (XLI)", 3),
+    rep("Materials (XLB)", 3)
+  )
+) %>%
+  gt::gt() %>%
+  gt::tab_header(title = "Stock Universe: 27 Large-Cap Stocks (3 per Sector)")
+```
+
+### A.2 Data & Pair Construction
+
+```{r}
+#| label: stk-data
+
+stk_raw <- tidyquant::tq_get(stk_tickers,
+                              get  = "stock.prices",
+                              from = train_start,
+                              to   = test_end + 1) %>%
+  dplyr::select(date, symbol, adjusted) %>%
+  dplyr::rename(ticker = symbol, price = adjusted)
+
+stk_wide <- stk_raw %>%
+  tidyr::pivot_wider(names_from = ticker, values_from = price) %>%
+  dplyr::arrange(date)
+
+stk_pair_grid <- tidyr::expand_grid(leg1 = stk_tickers, leg2 = stk_tickers) %>%
+  dplyr::filter(leg1 < leg2) %>%
+  dplyr::mutate(
+    pair_id    = paste0(leg1, "_", leg2),
+    valid_from = train_start
+  )
+```
+
+### A.3 Feature Computation
+
+```{r}
+#| label: stk-features
+#| cache: true
+
+stk_cl <- parallel::makeCluster(parallel::detectCores() - 1)
+doParallel::registerDoParallel(stk_cl)
+
+stk_task_grid <- tidyr::expand_grid(
+  pair_pos  = seq_len(nrow(stk_pair_grid)),
+  month_pos = seq_along(month_ends)
+)
+
+stk_features_list <- foreach::foreach(
+  i = seq_len(nrow(stk_task_grid)),
+  .combine  = dplyr::bind_rows,
+  .packages = c("tidyverse", "pracma"),
+  .export   = c("stk_pair_grid", "month_ends", "stk_wide", "window_roll",
+                "half_life", "hurst_exp", "spread_vol",
+                "compute_pair_feats_monthEnd")
+) %dopar% {
+  pr <- stk_pair_grid[stk_task_grid$pair_pos[i], ]
+  md <- month_ends[stk_task_grid$month_pos[i]]
+  compute_pair_feats_monthEnd(pr, md, stk_wide)
+}
+
+parallel::stopCluster(stk_cl)
+
+stk_features_clean <- stk_features_list %>%
+  tidyr::drop_na(half_life, hurst, spread_vol) %>%
+  dplyr::filter(half_life > 0, half_life < Inf, spread_vol > 0)
+```
+
+### A.4 Normalization & K Selection
+
+```{r}
+#| label: stk-norm-k
+
+stk_features_train <- stk_features_clean %>% dplyr::filter(date <= train_end)
+stk_features_test  <- stk_features_clean %>% dplyr::filter(date >= test_start)
+
+stk_norm_recipe <- recipes::recipe(
+  ~ half_life + hurst + spread_vol,
+  data = stk_features_train
+) %>%
+  recipes::step_normalize(recipes::all_numeric_predictors()) %>%
+  recipes::prep()
+
+stk_train_baked <- recipes::bake(stk_norm_recipe, stk_features_train) %>%
+  dplyr::bind_cols(stk_features_train %>% dplyr::select(pair_id, date))
+
+stk_test_baked <- recipes::bake(stk_norm_recipe, stk_features_test) %>%
+  dplyr::bind_cols(stk_features_test %>% dplyr::select(pair_id, date))
+
+stk_last_train_month <- max(stk_features_train$date)
+
+stk_feat_matrix <- stk_train_baked %>%
+  dplyr::filter(date == stk_last_train_month) %>%
+  dplyr::select(half_life, hurst, spread_vol) %>%
+  as.matrix()
+
+stk_k_results <- tibble::tibble(k = k_min:k_max + 1) %>%
+  dplyr::mutate(
+    avg_sil = purrr::map_dbl(k, function(kk) {
+      if (nrow(stk_feat_matrix) <= kk) return(NA_real_)
+      km     <- kmeans(stk_feat_matrix, centers = kk, nstart = 25, iter.max = 100)
+      sil_km <- mean(cluster::silhouette(km$cluster, dist(stk_feat_matrix))[, 3])
+      hc     <- hclust(dist(stk_feat_matrix), method = "ward.D2")
+      cl_lab <- cutree(hc, k = kk)
+      sil_hc <- mean(cluster::silhouette(cl_lab, dist(stk_feat_matrix))[, 3])
+      (sil_km + sil_hc) / 2
+    })
+  )
+
+stk_optimal_k <- stk_k_results %>%
+  dplyr::slice_max(avg_sil, n = 1, with_ties = FALSE) %>%
+  dplyr::pull(k)
+```
+
+### A.5 Backtest
+
+```{r}
+#| label: stk-backtest-train
+#| cache: true
+
+stk_train_results <- run_backtest(
+  pw             = stk_wide,
+  pair_grid      = stk_pair_grid,
+  feat_data_raw  = stk_features_clean,
+  feat_data_norm = stk_train_baked,
+  norm_rec       = stk_norm_recipe,
+  k              = stk_optimal_k,
+  entry_thresh   = entry_zscore,
+  start_date     = train_start,
+  end_date       = train_end
+)
+```
+
+```{r}
+#| label: stk-backtest-test
+#| cache: true
+
+stk_test_results <- run_backtest(
+  pw             = stk_wide,
+  pair_grid      = stk_pair_grid,
+  feat_data_raw  = stk_features_clean,
+  feat_data_norm = stk_test_baked,
+  norm_rec       = stk_norm_recipe,
+  k              = stk_optimal_k,
+  entry_thresh   = entry_zscore,
+  start_date     = test_start,
+  end_date       = test_end
+)
+```
+
+### A.6 Results
+
+```{r}
+#| label: stk-metrics
+
+stk_tr_xts <- stk_train_results %>% dplyr::select(date, port_ret) %>% timetk::tk_xts(date_var = date)
+stk_te_xts <- stk_test_results  %>% dplyr::select(date, port_ret) %>% timetk::tk_xts(date_var = date)
+
+tibble::tibble(
+  Universe       = c("ETF (Training)", "ETF (Test)", "Stocks (Training)", "Stocks (Test)"),
+  `Cum. Return`  = c(tail(train_results$cumeq, 1) - 1,    tail(test_results$cumeq, 1) - 1,
+                     tail(stk_train_results$cumeq, 1) - 1, tail(stk_test_results$cumeq, 1) - 1),
+  `Sharpe`       = c(SharpeRatio(tr_xts,     annualize = TRUE)[1],
+                     SharpeRatio(te_xts,     annualize = TRUE)[1],
+                     SharpeRatio(stk_tr_xts, annualize = TRUE)[1],
+                     SharpeRatio(stk_te_xts, annualize = TRUE)[1]),
+  `Omega Sharpe` = c(OmegaSharpeRatio(as.ts(tr_xts),     MAR = 0),
+                     OmegaSharpeRatio(as.ts(te_xts),     MAR = 0),
+                     OmegaSharpeRatio(as.ts(stk_tr_xts), MAR = 0),
+                     OmegaSharpeRatio(as.ts(stk_te_xts), MAR = 0)),
+  `Max Drawdown` = c(maxDrawdown(tr_xts),     maxDrawdown(te_xts),
+                     maxDrawdown(stk_tr_xts), maxDrawdown(stk_te_xts)),
+  `SPY Corr`     = c(cor(tr_xts,     spy_tr_xts, use = "complete.obs")[1, 2],
+                     cor(te_xts,     spy_te_xts, use = "complete.obs")[1, 2],
+                     cor(stk_tr_xts, spy_tr_xts, use = "complete.obs")[1, 2],
+                     cor(stk_te_xts, spy_te_xts, use = "complete.obs")[1, 2])
+) %>%
+  gt::gt() %>%
+  gt::tab_header(title = "ETF Strategy vs Stock Strategy") %>%
+  gt::fmt_percent(columns = c(`Cum. Return`, `Max Drawdown`), decimals = 1) %>%
+  gt::fmt_number(columns = c(Sharpe, `Omega Sharpe`, `SPY Corr`), decimals = 3) %>%
+  gt::tab_style(
+    style     = gt::cell_text(weight = "bold"),
+    locations = gt::cells_column_labels()
+  )
+```
+
+```{r}
+#| label: stk-equity-curves
+
+dplyr::bind_rows(
+  stk_train_results %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Stocks"),
+  train_results     %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "ETFs"),
+  spy_train         %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(values = c("Stocks" = "steelblue", "ETFs" = "black", "SPY" = "firebrick")) +
+  ggplot2::labs(title = "Training Period: Stocks vs ETFs vs SPY", x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+
+dplyr::bind_rows(
+  stk_test_results %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "Stocks"),
+  test_results     %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "ETFs"),
+  spy_test         %>% dplyr::select(date, cumeq) %>% dplyr::mutate(Series = "SPY")
+) %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = cumeq, color = Series)) +
+  ggplot2::geom_line(linewidth = 0.8) +
+  ggplot2::scale_color_manual(values = c("Stocks" = "steelblue", "ETFs" = "black", "SPY" = "firebrick")) +
+  ggplot2::labs(title = "Test Period: Stocks vs ETFs vs SPY", x = NULL, y = "Cumulative Equity", color = NULL) +
+  ggplot2::theme_minimal()
+```
+
+
+
+
+
+
+
+
+
