@@ -53,3 +53,9 @@ rsconnect/
 
   # Quarto cache (already covered by *_cache/ but explicit)
   *_cache/
+
+# Project-specific ignores
+.claude/
+QTP-Soumer_files/
+2026-04-04-qtp-design.md
+R/
